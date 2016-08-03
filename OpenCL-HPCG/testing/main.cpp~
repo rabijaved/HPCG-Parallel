@@ -1,0 +1,470 @@
+
+#ifndef HPCG_NOMPI
+#include <mpi.h> // If this routine is not compiled with HPCG_NOMPI
+#endif
+
+#include <fstream>
+#include <iostream>
+#include <cstdlib>
+#ifdef HPCG_DETAILED_DEBUG
+using std::cin;
+#endif
+using std::endl;
+
+#include <vector>
+
+#include "hpcg.hpp"
+
+#ifdef MAC
+#include <OpenCL/cl.h>
+#else
+#include <CL/cl.h>
+#endif
+
+#include "GenerateGeometry.hpp"
+#include "GenerateProblem.hpp"
+#include "GenerateCoarseProblem.hpp"
+#include "SetupHalo.hpp"
+#include "ExchangeHalo.hpp"
+#include "OptimizeProblem.hpp"
+#include "WriteProblem.hpp"
+#include "ReportResults.hpp"
+#include "mytimer.hpp"
+#include "ComputeSPMV_ref.hpp"
+#include "ComputeMG_ref.hpp"
+#include "ComputeResidual.hpp"
+#include "CG.hpp"
+#include "CG_ref.hpp"
+#include "Geometry.hpp"
+#include "SparseMatrix.hpp"
+#include "Vector.hpp"
+#include "CGData.hpp"
+#include "TestCG.hpp"
+#include "TestSymmetry.hpp"
+#include "TestNorms.hpp"
+#include "FlattenMatrix.hpp"
+#include "../OCL_src/oclSPMV.h"
+#include "../OCL_src/oclWAXPBY.h"
+#include "../OCL_src/oclProlongation.h"
+#include "../OCL_src/oclDProduct.h"
+#include "../OCL_src/oclRestriction.h"
+#include "../OCL_src/buildKernel.h"
+#include "../OCL_src/createDevice.h"
+
+#define SPMV_PATH "../src/kernelSPMV.cl"
+#define WAXPBY_PATH "../src/kernelWAXPBY.cl"
+#define PROLONGATION_PATH "../src/kernelProlongation.cl"
+#define DOTPRODUCT_PATH "../src/kernelDProduct.cl"
+#define RESTRICTION_PATH "../src/kernelRestriction.cl"
+
+#define SPMV_FUNCTION "kernelSPMV"
+#define WAXPBY_FUNCTION "kernelWAXPBY"
+#define PROLONGATION_FUNCTION "kernelPROLOG"
+#define DOTPRODUCT_FUNCTION "kernelDProduct"
+#define RESTRICTION_FUNCTION "kernelRestriction"
+
+#define HPCG_DEBUG
+#define HPCG_DETAILED_DEBUG
+
+/*!
+  Main driver program: Construct synthetic problem, run V&V tests, compute benchmark parameters, run benchmark, report results.
+
+  @param[in]  argc Standard argument count.  Should equal 1 (no arguments passed in) or 4 (nx, ny, nz passed in)
+  @param[in]  argv Standard argument array.  If argc==1, argv is unused.  If argc==4, argv[1], argv[2], argv[3] will be interpreted as nx, ny, nz, resp.
+
+  @return Returns zero on success and a non-zero value otherwise.
+
+*/
+int main(int argc, char * argv[]) {
+
+#ifndef HPCG_NOMPI
+  MPI_Init(&argc, &argv);
+#endif
+
+  HPCG_Params params;
+
+  HPCG_Init(&argc, &argv, params);
+
+  int size = params.comm_size, rank = params.comm_rank; // Number of MPI processes, My process ID
+
+#ifdef HPCG_DETAILED_DEBUG
+  if (size < 100 && rank==0) HPCG_fout << "Process "<<rank<<" of "<<size<<" is alive with " << params.numThreads << " threads." <<endl;
+
+  if (rank==0) {
+    char c;
+    std::cout << "Press key to continue"<< std::endl;
+    std::cin.get(c);
+  }
+#ifndef HPCG_NOMPI
+  MPI_Barrier(MPI_COMM_WORLD);
+#endif
+#endif
+
+
+  printf("\nmy rank %d, my size %d", rank,size);
+
+  local_int_t nx,ny,nz;
+  nx = (local_int_t)params.nx;
+  ny = (local_int_t)params.ny;
+  nz = (local_int_t)params.nz;
+  int ierr = 0;  // Used to check return codes on function calls
+
+  if(rank == 0){
+  printf("\nInput Dimensions nx %d ny %d nz %d",nx,ny,nz);
+  printf("\nStart problem setup phase\n");
+
+  }
+
+
+  // //////////////////////
+  // Problem setup Phase //
+  /////////////////////////
+
+#ifdef HPCG_DEBUG
+  double t1 = mytimer();
+#endif
+
+  // Construct the geometry and linear system
+  Geometry * geom = new Geometry;
+  GenerateGeometry(size, rank, params.numThreads, nx, ny, nz, geom);
+
+  SparseMatrix A;
+  InitializeSparseMatrix(A, geom);
+
+  Vector b, x, xexact;
+  GenerateProblem(A, &b, &x, &xexact);
+  SetupHalo(A);
+  int numberOfMgLevels = 4; // Number of levels including first
+  SparseMatrix * curLevelMatrix = &A;
+  for (int level = 1; level< numberOfMgLevels; ++level) {
+	  GenerateCoarseProblem(*curLevelMatrix);
+	  curLevelMatrix = curLevelMatrix->Ac; // Make the just-constructed coarse grid the next level
+  }
+
+
+  CGData data;
+  InitializeSparseCGData(A, data);
+
+
+  // Use this array for collecting timing information
+  std::vector< double > times(9,0.0);
+
+  // Call user-tunable set up function.
+  double t7 = mytimer(); OptimizeProblem(A, data, b, x, xexact); t7 = mytimer() - t7;
+  times[7] = t7;
+#ifdef HPCG_DEBUG
+  if (rank==0) HPCG_fout << "Total problem setup time in main (sec) = " << mytimer() - t1 << endl;
+#endif
+
+
+
+
+  //////////////////////////////
+  // Validation Testing Phase //
+  //////////////////////////////
+
+
+
+  if(rank == 0){
+  printf("Start Validation Testing Phase");
+  }
+
+
+#ifdef HPCG_DEBUG
+  t1 = mytimer();
+#endif
+  TestCGData testcg_data;
+  testcg_data.count_pass = testcg_data.count_fail = 0;
+  TestCG(A, data, b, x, testcg_data);
+
+  TestSymmetryData testsymmetry_data;
+  TestSymmetry(A, b, xexact, testsymmetry_data);
+
+#ifdef HPCG_DEBUG
+  if (rank==0) HPCG_fout << "Total validation (TestCG and TestSymmetry) execution time in main (sec) = " << mytimer() - t1 << endl;
+#endif
+
+#ifdef HPCG_DEBUG
+  t1 = mytimer();
+#endif
+
+
+
+
+  //------------------------------initialize OCL Kernels---------------------------
+
+local_int_t numberOfNonzerosPerRow = 27; // We are approximating a 27-point finite element/volume/difference 3D stencil
+     cl_device_id device;
+     cl_context context;
+     cl_program programSPMV,programWAXPBY,programProlongation, programDotProduct,programRestriction;
+     cl_kernel kernelSPMV,kernelWAXPBY,kernelProlongation,kernelDotProduct,kernelRestriction;
+     size_t max_local_size;
+     cl_int err;
+
+     int plat_id = 0;
+     int dev_id = 1;
+
+     device = create_device(plat_id, dev_id);
+
+     if(device == (cl_device_id)EXIT_SUCCESS) exit(1);
+
+     context = clCreateContext(NULL, 1, &device, NULL, NULL, &err);
+     if(err < 0) {
+        perror("Couldn't create a context");
+        exit(1);
+     }
+
+     //build kernels
+
+     programSPMV = build_program(context, device, SPMV_PATH);
+     programWAXPBY = build_program(context, device, WAXPBY_PATH);
+     programProlongation = build_program(context, device, PROLONGATION_PATH);
+     programDotProduct = build_program(context, device, DOTPRODUCT_PATH);
+     programRestriction = build_program(context, device, RESTRICTION_PATH);
+
+     //create kernels
+
+     kernelSPMV = clCreateKernel(programSPMV, SPMV_FUNCTION, &err);
+     if(err < 0) {
+        perror("Couldn't create SPMV kernel");
+        exit(1);
+     };
+
+     kernelWAXPBY = clCreateKernel(programWAXPBY, WAXPBY_FUNCTION, &err);
+     if(err < 0) {
+        perror("Couldn't create WAXPBY kernel");
+        exit(1);
+     };
+
+     kernelProlongation = clCreateKernel(programProlongation, PROLONGATION_FUNCTION, &err);
+     if(err < 0) {
+        perror("Couldn't create Prolongation kernel");
+        exit(1);
+     };
+
+     kernelDotProduct = clCreateKernel(programDotProduct, DOTPRODUCT_FUNCTION, &err);
+     if(err < 0) {
+        perror("Couldn't create Dot product kernel");
+        exit(1);
+     };
+
+     kernelRestriction = clCreateKernel(programRestriction, RESTRICTION_FUNCTION, &err);
+         if(err < 0) {
+            perror("Couldn't create restriction kernel");
+            exit(1);
+         };
+
+//------------------------------Done Creating Kernels---------------------------------------
+
+
+if(rank == 0){
+  FlattenMatrix(A,  numberOfNonzerosPerRow);
+
+  
+  printf("Initialized OCL Objects\n");
+  }
+
+  ///////////////////////////////////////
+  // Reference SpMV+MG Timing Phase //
+  ///////////////////////////////////////
+
+  // Call Reference SpMV and MG. Compute Optimization time as ratio of times in these routines
+
+
+
+  if(rank == 0){
+  printf("\nStart SPMV+MG Timing Phase");
+  }
+
+
+  local_int_t nrow = A.localNumberOfRows;
+  local_int_t ncol = A.localNumberOfColumns;
+
+  Vector x_overlap, b_computed;
+  InitializeVector(x_overlap, ncol); // Overlapped copy of x vector
+  InitializeVector(b_computed, nrow); // Computed RHS vector
+
+
+  // Record execution time of reference SpMV and MG kernels for reporting times
+  // First load vector with random values
+  FillRandomVector(x_overlap);
+
+  int numberOfCalls = 10;
+  double t_begin = mytimer();
+  for (int i=0; i< numberOfCalls; ++i) {
+
+    runSPMV(A.localNumberOfRows,
+  		  A.localNumberOfNonzeros,
+  		  A.nonzerosInRow,
+  		  A.flat_mtxIndL,
+  		  A.flat_matrixValues,
+		  x_overlap.values,
+		  x_overlap.localLength,
+		  b_computed.values,
+		  b_computed.localLength,
+  			device,
+  			context,
+  			kernelSPMV);
+
+    //ierr = ComputeSPMV_ref(A, x_overlap, b_computed); // b_computed = A*x_overlap
+    //if (ierr) HPCG_fout << "Error in call to SpMV: " << ierr << ".\n" << endl;
+    ierr = ComputeMG_ref(A, b_computed, x_overlap); // b_computed = Minv*y_overlap
+    if (ierr) HPCG_fout << "Error in call to MG: " << ierr << ".\n" << endl;
+  }
+  times[8] = (mytimer() - t_begin)/((double) numberOfCalls);  // Total time divided by number of calls.
+#ifdef HPCG_DEBUG
+  if (rank==0) HPCG_fout << "Total SpMV+MG timing phase execution time in main (sec) = " << mytimer() - t1 << endl;
+#endif
+
+
+
+
+  char c;
+  std::cout << "Press key to continue"<< std::endl;
+  std::cin.get(c);
+  printf("Running SPMV");
+
+  Vector & r = data.r; // Residual vector
+  Vector & z = data.z; // Preconditioned residual vector
+  Vector & p = data.p; // Direction vector (in MPI mode ncol>=nrow)
+  Vector & Ap = data.Ap;
+
+  local_int_t numberOfNonzerosPerRow = 27; // We are approximating a 27-point finite element/volume/difference 3D stencil
+
+  FlattenMatrix(A,  numberOfNonzerosPerRow);
+  runSPMV(A.localNumberOfRows,
+		  numberOfNonzerosPerRow,
+		  A.nonzerosInRow,
+		  A.flat_mtxIndL,
+		  A.flat_matrixValues,
+		  p.values,
+		  p.localLength,
+		  Ap.values,
+		  Ap.localLength,
+			device,
+			context,
+			kernelSPMV);
+
+  printf("\nCompleted SPMV. Running WAXPBY\n");
+  std::cout << "Press key to continue"<< std::endl;
+  std::cin.get(c);
+
+  runWAXPBY(A.localNumberOfRows,1.0,-1.0,
+  		b.values,
+  		b.localLength,
+  		Ap.values,
+  		Ap.localLength,
+  		r.values,
+  		r.localLength,
+		device,
+		context,
+		kernelWAXPBY);
+
+
+
+  printf("\nCompleted WAXPBY. Running Prolongation\n");
+
+
+  double * xfv = x.values;
+  double * xcv = A.mgData->xc->values;
+  int * f2c = A.mgData->f2cOperator;
+  int nc = A.mgData->rc->localLength;
+
+
+
+  printf("nc %d x %d xc %d fc %d\n",nc,x.localLength,A.mgData->xc->localLength,A.localNumberOfRows);
+
+
+
+  std::cout << "Press key to continue"<< std::endl;
+  std::cin.get(c);
+
+
+
+
+  runProlongation(0, 1,nc,xfv,x.localLength,
+		  xcv,
+		  A.mgData->xc->localLength,
+		  f2c,
+		  A.localNumberOfRows,
+			device,
+			context,
+			kernelProlongation);
+
+
+
+  printf("\nCompleted Prolongation. Running Dot Product\n");
+
+  std::cout << "Press key to continue"<< std::endl;
+  std::cin.get(c);
+
+
+  double * rfv = r.values;
+  double * bfv = b.values;
+
+  runDotProduct(0, 1,A.localNumberOfRows,rfv,r.localLength,bfv,b.localLength,xfv,x.localLength);
+
+  printf("\nCompleted Dot Product. Running Restriction\n");
+
+  double * Axfv = A.mgData->Axf->values;
+  double * rcv = A.mgData->rc->values;
+
+  runRestriction(0, 1,nc,Axfv,
+		  A.mgData->Axf->localLength,rfv,
+		  r.localLength,rcv,
+		  A.mgData->rc->localLength,f2c,
+		  A.localNumberOfRows,
+			device,
+			context,
+			kernelRestriction);
+
+
+  printf("\nCompleted Restriction.");
+
+
+
+
+
+
+
+
+
+
+
+
+  // Clean up
+  DeleteMatrix(A); // This delete will recursively delete all coarse grid data
+  DeleteCGData(data);
+  DeleteVector(x);
+  DeleteVector(b);
+  DeleteVector(xexact);
+
+
+
+
+  HPCG_Finalize();
+
+
+  clReleaseKernel(kernelSPMV);
+  clReleaseKernel(kernelWAXPBY);
+  clReleaseKernel(kernelProlongation);
+  clReleaseKernel(kernelDotProduct);
+  clReleaseKernel(kernelRestriction);
+  clReleaseProgram(programSPMV);
+  clReleaseProgram(programWAXPBY);
+  clReleaseProgram(programProlongation);
+  clReleaseProgram(programDotProduct);
+  clReleaseProgram(programRestriction);
+  clReleaseContext(context);
+
+  // Finish up
+#ifndef HPCG_NOMPI
+  MPI_Finalize();
+#endif
+  return 0 ;
+}
+
+
+
+
+
